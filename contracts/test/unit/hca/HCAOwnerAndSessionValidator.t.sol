@@ -50,6 +50,9 @@ contract HCAOwnerAndSessionValidatorTest is Test {
         uint48 maxRefundGasOverhead;
         uint96 maxRefundAmount;
         uint8 sessionToEnableIndex;
+        address renewPaymentToken;
+        uint64 renewalDuration;
+        uint96 maxRenewSpend;
         HCASmartSessionLib.HashAndChainId[] hashesAndChainIds;
         bytes32 ownerR;
         bytes32 ownerS;
@@ -855,6 +858,9 @@ contract HCAOwnerAndSessionValidatorTest is Test {
             proof.maxRefundGasOverhead,
             proof.maxRefundAmount,
             proof.sessionToEnableIndex,
+            proof.renewPaymentToken,
+            proof.renewalDuration,
+            proof.maxRenewSpend,
             uint8(proof.hashesAndChainIds.length)
         );
         for (uint256 i; i < proof.hashesAndChainIds.length; ++i) {

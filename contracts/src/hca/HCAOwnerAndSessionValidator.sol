@@ -11,12 +11,15 @@ import {ERC1271_MAGICVALUE, VALIDATION_FAILED, VALIDATION_SUCCESS} from "nexus/t
 import {Execution} from "nexus/types/DataTypes.sol";
 
 import {IETHRegistrar} from "../registrar/interfaces/IETHRegistrar.sol";
+import {IETHRenewer, RenewData} from "../registrar/interfaces/IETHRenewer.sol";
+import {IPermissionedRegistry} from "../registry/interfaces/IPermissionedRegistry.sol";
 import {
     IDefaultReverseRegistrarAdapter
 } from "../reverse-registrar/interfaces/IDefaultReverseRegistrarAdapter.sol";
 import {
     IReverseRegistrarAdapter
 } from "../reverse-registrar/interfaces/IReverseRegistrarAdapter.sol";
+import {LibLabel} from "../utils/LibLabel.sol";
 
 import {HCAValidatorBase} from "./HCAValidatorBase.sol";
 import {IStandaloneHCAOwner} from "./interfaces/IStandaloneHCAOwner.sol";
@@ -57,6 +60,17 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         uint48 maxRefundGasOverhead;
         uint96 maxRefundAmount;
         uint8 sessionToEnableIndex;
+        address renewPaymentToken;
+        uint64 renewalDuration;
+        uint96 maxRenewSpend;
+    }
+
+    /// @dev The renew caps the owner bound into the session. See `DECISIONS.md` D4, D6 and D7.
+    ///      The period cap is the owner's ERC-20 allowance, not a field here.
+    struct RenewPolicy {
+        address paymentToken;
+        uint64 duration;
+        uint96 maxSpend;
     }
 
     /// @dev State collected while the validator checks one operation batch.
@@ -64,6 +78,16 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         bool usesResolver;
         bool deploysResolver;
         address authorizedRegistrar;
+        // The renew batch. The exactness tests run after the loop, because the price is only
+        // known once the renew execution is read. See `DECISIONS.md` D8.
+        address renewTarget;
+        uint256 renewPrice;
+        address renewApproveSpender;
+        uint256 renewApproveAmount;
+        uint256 renewPullAmount;
+        bool renewed;
+        bool renewApproved;
+        bool renewPulled;
     }
 
     /// @dev State collected while validating an optional owner-funded token pull.
@@ -88,7 +112,7 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
     bytes1 internal constant FIXED_SESSION_REFUND_ENABLE_MODE = 0x05;
 
     /// @dev Fixed fields in a packed session authorization before its chain entries.
-    uint256 private constant _SESSION_PROOF_HEADER_LENGTH = 110;
+    uint256 private constant _SESSION_PROOF_HEADER_LENGTH = 150;
 
     /// @dev Fixed proof bytes including the owner signature but excluding chain entries.
     uint256 private constant _SESSION_PROOF_BASE_LENGTH =
@@ -619,7 +643,12 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
             operation.executions,
             gasRefund,
             proof.refundToken,
-            true
+            true,
+            RenewPolicy({
+                paymentToken: proof.renewPaymentToken,
+                duration: proof.renewalDuration,
+                maxSpend: proof.maxRenewSpend
+            })
         );
     }
 
@@ -631,7 +660,8 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         Execution[] memory executions,
         GasRefund memory gasRefund,
         address fundingToken,
-        bool requireAction
+        bool requireAction,
+        RenewPolicy memory renewPolicy
     )
         internal
         view
@@ -648,6 +678,18 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
             }
 
             bytes4 selector = _selector(execution.callData);
+
+            // The renew money legs, before every other branch. Gated on the session's renew
+            // payment token, which is zero for a registration session, so register and commit
+            // reach this never and keep their own rules untouched. See `DECISIONS.md` D8.
+            if (
+                renewPolicy.paymentToken != address(0) &&
+                execution.target == renewPolicy.paymentToken &&
+                (selector == IERC20.approve.selector || selector == IERC20.transferFrom.selector)
+            ) {
+                _checkRenewMoneyCall(execution, selector, funding, state);
+                continue;
+            }
 
             if (
                 funding.enabled &&
@@ -680,6 +722,14 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
                 if (allowedResolver.code.length == 0 && !state.deploysResolver) {
                     revert PolicyRuleFailed();
                 }
+                continue;
+            }
+
+            if (selector == IETHRenewer.renew.selector) {
+                if (!_isAuthorizedRenewer(execution.target)) {
+                    revert ActionNotAllowed(execution.target, selector);
+                }
+                _checkRenewCall(execution, owner, renewPolicy, state);
                 continue;
             }
 
@@ -747,6 +797,7 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         if (funding.permitted != funding.transferred || (requireAction && actionCount == 0)) {
             revert PolicyRuleFailed();
         }
+        _checkRenewBatch(state);
         _checkResolverBinding(allowedResolver, state);
     }
 
@@ -840,6 +891,123 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         }
     }
 
+    /// @dev Records one renew money leg: the approve to the renewer, or the pull from the owner.
+    ///      Records only. The exactness tests are in `_checkRenewBatch`, after the loop, because
+    ///      the price comes from the renew execution and that may appear later in the batch.
+    ///      The pull shape matches `_checkFundingCall`: source the owner, destination the HCA.
+    ///      It needs no permit, because the owner granted a standing allowance. See D6 and D8.
+    /// @param execution The money execution.
+    /// @param selector The execution's function selector.
+    /// @param funding The funding state, read for the HCA and its owner only.
+    /// @param state The batch state to record into.
+    function _checkRenewMoneyCall(
+        Execution memory execution,
+        bytes4 selector,
+        FundingPolicyState memory funding,
+        RegistrationPolicyState memory state
+    )
+        internal
+        pure
+    {
+        if (selector == IERC20.approve.selector) {
+            if (state.renewApproved || execution.callData.length != 4 + 2 * 32) {
+                revert PolicyRuleFailed();
+            }
+            state.renewApproveSpender = _readAddress(execution.callData, 4);
+            state.renewApproveAmount = _readUint(execution.callData, 4 + 32);
+            state.renewApproved = true;
+            return;
+        }
+        if (state.renewPulled || execution.callData.length != 4 + 3 * 32) {
+            revert PolicyRuleFailed();
+        }
+        _requireArgAddress(execution.callData, 4, funding.owner);
+        _requireArgAddress(execution.callData, 4 + 32, funding.account);
+        state.renewPullAmount = _readUint(execution.callData, 4 + 2 * 32);
+        state.renewPulled = true;
+    }
+
+    /// @dev Requires a renew batch to pull and approve the exact quoted price, and nothing else.
+    ///      `batch.target` passed `_isAuthorizedRenewer` in the renew case, so requiring the
+    ///      approve spender to equal it also proves the spender holds `ROLE_RENEW`. D8 point 1.
+    /// @param state The collected batch state.
+    function _checkRenewBatch(RegistrationPolicyState memory state) internal pure {
+        if (!state.renewed) {
+            // A money leg on the renew payment token without a renewal has no purpose.
+            if (state.renewApproved || state.renewPulled) {
+                revert PolicyRuleFailed();
+            }
+            return;
+        }
+        if (
+            !state.renewApproved ||
+            !state.renewPulled ||
+            state.renewApproveSpender != state.renewTarget ||
+            state.renewApproveAmount != state.renewPrice ||
+            state.renewPullAmount != state.renewPrice
+        ) {
+            revert PolicyRuleFailed();
+        }
+    }
+
+    /// @dev Requires a renewal target to hold the registry's renew role.
+    ///      Asks the question the registry asks. The registry gates renewal on `ROLE_RENEW`, so a
+    ///      `ROLE_REGISTRAR` check would get the wrong answer for `ETHRenewerV1`, which holds renew
+    ///      and not registrar. A role query, not an address, so it survives a redeploy of either.
+    ///      Does not pin the target into `state.authorizedRegistrar`. That slot selects the one
+    ///      registrar a batch may register through, and a renewer is a different contract, so
+    ///      sharing the slot would refuse a batch that registers and renews.
+    /// @param account The prospective renewer.
+    /// @return authorized Whether the account may renew through the registry.
+    function _isAuthorizedRenewer(address account) internal view returns (bool authorized) {
+        if (account == address(0)) {
+            return false;
+        }
+        return HCARegistrarPolicyLib.isRenewAuthorized(ETH_REGISTRY, account);
+    }
+
+    /// @dev Applies the renew caps to one renew execution.
+    ///      Holds the locals that the policy loop has no stack room for.
+    ///      Reads the owner through `getState`, which keeps answering after expiry, so a renewal
+    ///      inside the grace period passes. `ownerOf` stops answering there.
+    /// @param execution The renew execution.
+    /// @param owner The HCA owner the session is bound to.
+    /// @param renewPolicy The caps the owner signed into the session.
+    function _checkRenewCall(
+        Execution memory execution,
+        address owner,
+        RenewPolicy memory renewPolicy,
+        RegistrationPolicyState memory state
+    )
+        internal
+        view
+    {
+        if (state.renewed) {
+            revert PolicyRuleFailed();
+        }
+        (RenewData memory rd, IERC20 token) =
+            abi.decode(HCAExecutionLib.callArgs(execution.callData), (RenewData, IERC20));
+        // `getState` takes a labelhash and rebuilds the versioned token id. `latestOwnerOf` takes
+        // the versioned id only, and the validator holds a label, so it would read zero.
+        if (IPermissionedRegistry(ETH_REGISTRY).getState(LibLabel.id(rd.label)).latestOwner != owner)
+        {
+            revert PolicyRuleFailed();
+        }
+        if (rd.duration != renewPolicy.duration || address(token) != renewPolicy.paymentToken) {
+            revert PolicyRuleFailed();
+        }
+        // No separate renewability pre-check. `getRenewPrice` calls `_requireRenewable`, which
+        // runs the same `_isRenewable` predicate and reverts `NameNotRenewable`, so a target
+        // that will not renew the name is refused here by the price call itself. See D7.
+        uint256 price = IETHRenewer(execution.target).getRenewPrice(rd.label, rd.duration, token);
+        if (price > renewPolicy.maxSpend) {
+            revert PolicyRuleFailed();
+        }
+        state.renewTarget = execution.target;
+        state.renewPrice = price;
+        state.renewed = true;
+    }
+
     /// @dev Decodes the packed fixed fields and locates the multi-chain owner authorization.
     ///      Returns a zero proof end when the envelope cannot contain the required tail.
     function _decodeSessionEnableProof(bytes calldata data, uint256 tailLength)
@@ -882,7 +1050,11 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
             bytes12(data[proofOffset + 78:proofOffset + 90])
         ), maxRefundGasOverhead: uint48(bytes6(data[proofOffset + 90:proofOffset + 96])), maxRefundAmount: uint96(
             bytes12(data[proofOffset + 96:proofOffset + 108])
-        ), sessionToEnableIndex: uint8(data[proofOffset + 108])});
+        ), sessionToEnableIndex: uint8(data[proofOffset + 108]), renewPaymentToken: address(
+            bytes20(data[proofOffset + 109:proofOffset + 129])
+        ), renewalDuration: uint64(bytes8(data[proofOffset + 129:proofOffset + 137])), maxRenewSpend: uint96(
+            bytes12(data[proofOffset + 137:proofOffset + 149])
+        )});
         packedSessions = data[sessionsOffset:signatureOffset];
         ownerSignature = data[signatureOffset:proofEnd];
     }
@@ -931,6 +1103,18 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
     }
 
     /// @dev Hashes the fixed HCA fields stored in the standard Smart Session salt.
+    ///      The three renew caps do not take words of their own. Each cap sits in spare high
+    ///      bits of a word this salt already hashes, so the field count stays at seven and no
+    ///      encoded byte moves. A session that does not enable auto-renew holds zero in all
+    ///      three caps. Zero sets no bit, so each packed word keeps the value the pristine
+    ///      validator hashed, and the derived `permissionId` does not change. An owner who
+    ///      signed a session before this rule shipped keeps that signature. See D11.
+    ///      The packing loses nothing. Each field holds its own bit range. No range overlaps:
+    ///        word 1  sessionNonce          bits 0-95    renewPaymentToken  bits 96-255
+    ///        word 6  maxRefundGasOverhead  bits 0-47    renewalDuration    bits 48-111
+    ///                maxRenewSpend         bits 112-207
+    ///      One word therefore maps to one field set only. The salt commits to the renew caps
+    ///      as strongly as three separate words commit to them.
     function _sessionAuthorizationSalt(SessionEnableProof memory proof)
         internal
         pure
@@ -939,12 +1123,15 @@ contract HCAOwnerAndSessionValidator is HCAValidatorBase {
         return
             keccak256(
                 abi.encode(
-                    proof.sessionNonce,
+                    uint256(proof.sessionNonce) |
+                        (uint256(uint160(proof.renewPaymentToken)) << 96),
                     proof.validUntil,
                     proof.resolver,
                     proof.refundToken,
                     proof.maxRefundExchangeRate,
-                    proof.maxRefundGasOverhead,
+                    uint256(proof.maxRefundGasOverhead) |
+                        (uint256(proof.renewalDuration) << 48) |
+                        (uint256(proof.maxRenewSpend) << 112),
                     proof.maxRefundAmount
                 )
             );

@@ -2359,7 +2359,8 @@ contract HCAOwnerAndSessionValidatorHarness is HCAOwnerAndSessionValidator {
             operation.executions,
             GasRefund(address(0), 0, 0),
             address(0),
-            false
+            false,
+            RenewPolicy({paymentToken: address(0), duration: 0, maxSpend: 0})
         );
     }
 
@@ -2379,7 +2380,8 @@ contract HCAOwnerAndSessionValidatorHarness is HCAOwnerAndSessionValidator {
             executions,
             GasRefund(address(0), 0, 0),
             address(0),
-            false
+            false,
+            RenewPolicy({paymentToken: address(0), duration: 0, maxSpend: 0})
         );
     }
 
@@ -2406,7 +2408,9 @@ contract HCAOwnerAndSessionValidatorHarness is HCAOwnerAndSessionValidator {
             resolver,
             RegistrationPolicyState({usesResolver: usesResolver, deploysResolver: deploysResolver, authorizedRegistrar: address(
                 0
-            )})
+            ), renewTarget: address(0), renewPrice: 0, renewApproveSpender: address(
+                0
+            ), renewApproveAmount: 0, renewPullAmount: 0, renewed: false, renewApproved: false, renewPulled: false})
         );
     }
 

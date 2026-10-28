@@ -30,6 +30,21 @@ library HCARegistrarPolicyLib {
             IPermissionedRegistry(registry).hasRootRoles(RegistryRolesLib.ROLE_REGISTRAR, account);
     }
 
+    /// @notice Returns whether an account may renew through the registry.
+    /// @dev Checks the renew role at the registry root. Renewal is a different authority from
+    ///      registration: the registry gates renewal on `ROLE_RENEW`, so the policy asks for
+    ///      `ROLE_RENEW`. `ETHRenewerV1` holds it and does not hold `ROLE_REGISTRAR`.
+    /// @param registry The permissioned ENS registry.
+    /// @param account The prospective renewer.
+    /// @return authorized Whether the account holds the root renew role.
+    function isRenewAuthorized(address registry, address account)
+        internal
+        view
+        returns (bool authorized)
+    {
+        return IPermissionedRegistry(registry).hasRootRoles(RegistryRolesLib.ROLE_RENEW, account);
+    }
+
     /// @notice Returns whether a registrar's current rent oracle accepts a payment token.
     /// @dev Fails closed when the registrar or its oracle does not answer as expected.
     /// @param registrar The registrar whose oracle decides payment-token support.
